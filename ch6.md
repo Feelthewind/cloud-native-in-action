@@ -5,6 +5,57 @@
 - **스레드 수 설정**: 패키토 빌드팩 환경 변수 `BPL_JVM_THREAD_COUNT=50`을 사용하여 메모리 계산을 위한 스레드 수를 설정한다.
 - **네트워킹**: 도커 컴포즈는 기본적으로 두 개의 컨테이너를 같은 네트워크에 연결하므로 명시적으로 네트워크를 지정할 필요가 없다.
 
+```
+version: "3.8"
+services:
+
+  # Applications
+
+  catalog-service:
+    depends_on:
+      - polar-postgres
+    image: "catalog-service"
+    container_name: "catalog-service"
+    ports:
+      - 9001:9001
+      - 8001:8001
+    environment:
+      # Buildpacks environment variable to configure the number of threads in memory calculation
+      - BPL_JVM_THREAD_COUNT=50
+      # Buildpacks environment variable to enable debug through a socket on port 8001
+      - BPL_DEBUG_ENABLED=true
+      - BPL_DEBUG_PORT=8001
+      - SPRING_CLOUD_CONFIG_URI=http://config-service:8888
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://polar-postgres:5432/polardb_catalog
+      - SPRING_PROFILES_ACTIVE=testdata
+  
+  config-service:
+    image: "config-service"
+    container_name: "config-service"
+    ports:
+      - 8888:8888
+      - 9888:9888
+    environment:
+      # Buildpacks environment variable to configure the number of threads in memory calculation
+      - BPL_JVM_THREAD_COUNT=50
+      # Buildpacks environment variable to enable debug through a socket on port 9888
+      - BPL_DEBUG_ENABLED=true
+      - BPL_DEBUG_PORT=9888
+
+  # Backing Services
+
+  polar-postgres:
+    image: "postgres:14.12"
+    container_name: "polar-postgres"
+    ports:
+      - 5432:5432
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=polardb_catalog
+
+```
+
 # 2. 스프링 부트 컨테이너 디버깅
 
 - **컨테이너에서의 디버깅**: 컨테이너 내에서 실행될 때 로컬 컴퓨터에서 프로세스가 실행되지 않으므로 IDE에서 직접 디버깅을 할 수 없다.
@@ -33,3 +84,90 @@
   - **도커 로그인**: `docker/login-action@v2`를 사용하여 `REGISTRY`, `github.actor`, `secrets.GITHUB_TOKEN` 같은 환경 변수를 사용해 레지스트리에 인증.
   - **보고서**: 취약점 스캔 결과는 깃허브 저장소의 '보안' 섹션에서 확인할 수 있다.
   - **공개 저장소**: 취약점 보고서는 깃허브 저장소가 공개 상태여야만 업로드 가능하며, 엔터프라이즈 구독 시 비공개 저장소도 지원된다.
+ 
+```
+name: Commit Stage
+on: push
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: lcs86-dev/catalog-service
+  VERSION: latest
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+      - name: Build, unit tests and integration tests
+        run: |
+          chmod +x gradlew
+          ./gradlew build
+      - name: Code vulnerability scanning
+        uses: anchore/scan-action@v3
+        id: scan
+        with:
+          path: "${{ github.workspace }}"
+          fail-build: false
+          severity-cutoff: high
+      - name: Upload vulnerability report
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure()
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+  package:
+    name: Package and Publish
+    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: [ build ]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+      - name: Build container image
+        run: |
+          chmod +x gradlew
+          ./gradlew bootBuildImage \
+            --imageName ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+      - name: OCI image vulnerability scanning
+        uses: anchore/scan-action@v3
+        id: scan
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          fail-build: false
+          severity-cutoff: high
+      - name: Upload vulnerability report
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure()
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+      - name: Log into container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_TOKEN }}
+      - name: Publish container image
+        run: docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+
+```
